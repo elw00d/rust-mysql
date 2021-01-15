@@ -145,10 +145,9 @@ struct Handshake {
     capability_flags: CapabilityFlags,
 }
 
-// todo: remove offset
-fn parse_null_terminated_str(buf: &[u8], offset: usize) -> String {
+fn parse_null_terminated_str(buf: &[u8]) -> String {
     let mut vec = Vec::new();
-    let mut i = offset;
+    let mut i = 0;
     while i < buf.len() && buf[i] != 0_u8 {
         vec.push(buf[i]);
         i += 1;
@@ -161,7 +160,7 @@ fn parse_handshake(buf: &[u8]) -> Handshake {
     let protocol_version = buf[offset];
     assert_eq!(protocol_version, 10, "unsupported protocol");
     offset += 1;
-    let server_version = parse_null_terminated_str(buf, offset);
+    let server_version = parse_null_terminated_str(&buf[offset..]);
     offset += server_version.len() + 1;
     let connection_id = LittleEndian::read_u32(&buf[offset..]);
     offset += mem::size_of::<u32>();
@@ -197,7 +196,7 @@ fn parse_handshake(buf: &[u8]) -> Handshake {
     auth_plugin_data.extend_from_slice(&buf[offset..offset + auth_plugin_data_part2_len]);
     offset += auth_plugin_data_part2_len;
 
-    let auth_plugin_name = parse_null_terminated_str(buf, offset);
+    let auth_plugin_name = parse_null_terminated_str(&buf[offset..]);
 
     return Handshake {
         protocol_version,
