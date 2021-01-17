@@ -225,9 +225,38 @@ fn write_null_terminated_str(buf: &mut Vec<u8>, str: &str) -> usize {
     return written + 1;
 }
 
-// fn build_com_register_slave_cmd() -> Vec<u8> {
-//
-// }
+fn build_com_register_slave_cmd(server_id: u32) -> Vec<u8> {
+    let mut buf = vec![0_u8; 4];  // 4 bytes reserved for packet header
+
+    buf.write_u8(0x15);  // COM_REGISTER_SLAVE command
+    buf.write_u32::<LittleEndian>(server_id);
+    buf.write_u8(0);  // slaves hostname length
+    buf.write_u8(0);  // slaves user len
+    buf.write_u8(0);  // slaves password len
+    buf.write_u16::<LittleEndian>(0);  // slaves mysql-port
+    buf.write_u32::<LittleEndian>(0);  // replication rank
+    buf.write_u32::<LittleEndian>(0);  // master-id
+
+    // fill packet header
+    let packet_len = (buf.len() - 4) as u32;
+    LittleEndian::write_u24(&mut buf, packet_len);
+    buf[3] = 0x00;  // seq_id
+
+    return buf;
+}
+
+fn build_com_quit_cmd() -> Vec<u8> {
+    let mut buf = vec![0_u8; 4];  // 4 bytes reserved for packet header
+
+    buf.write_u8(0x01);  // COM_QUIT command
+
+    // fill packet header
+    let packet_len = (buf.len() - 4) as u32;
+    LittleEndian::write_u24(&mut buf, packet_len);
+    buf[3] = 0x00;  // seq_id
+
+    return buf;
+}
 
 fn build_handshake_response(handshake: &Handshake, username: &str, password: &str) -> Vec<u8> {
     let mut buf = vec![0_u8; 4];  // 4 bytes reserved for packet header
@@ -445,6 +474,24 @@ fn real_main() -> i32 {
             }
 
             println!("f");
+
+            let register_slave_cmd = build_com_register_slave_cmd(2345335);
+            stream.write(&register_slave_cmd);
+            stream.read(&mut buf);
+
+            let header = parse_header(&buf);
+
+            let packet = parse_generic_response(&header);
+
+
+            stream.write(&build_com_quit_cmd());
+            stream.read(&mut buf);
+
+            let header = parse_header(&buf);
+
+            let packet = parse_generic_response(&header);
+
+            println!("fff");
         }
         Err(e) => {
             println!("Failed to connect: {}", e)
