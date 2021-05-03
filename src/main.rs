@@ -3,11 +3,12 @@ use std::{io, thread, mem, fmt};
 use std::time::Duration;
 use std::str::FromStr;
 use std::io::{Error, Read, Write};
-use byteorder::{ByteOrder, LittleEndian, BigEndian, WriteBytesExt};
+use byteorder::{ByteOrder, LittleEndian, BigEndian, WriteBytesExt, LE};
 use mem::size_of;
 use bitflags::_core::cmp::max;
 use sha1::{Sha1, Digest};
 use std::collections::HashMap;
+use linked_hash_map::LinkedHashMap;
 
 extern crate byteorder;
 #[macro_use]
@@ -41,8 +42,30 @@ bitflags! {
         const CLIENT_CAN_HANDLE_EXPIRED_PASSWORDS = 0x00400000;
         const CLIENT_SESSION_TRACK = 0x00800000;
         const CLIENT_DEPRECATE_EOF = 0x01000000;
-        //const ABC = Self::A.bits | Self::B.bits | Self::C.bits;
     }
+}
+
+bitflags! {
+    struct BinlogDumpGtidFlags : u16 {
+        const BINLOG_DUMP_NON_BLOCK = 0x0001;
+        const BINLOG_THROUGH_POSITION = 0x0002;
+        const BINLOG_THROUGH_GTID = 0x0004;
+    }
+}
+
+/// https://dev.mysql.com/doc/refman/5.6/en/replication-gtids-concepts.html
+struct GtidSet {
+    map: LinkedHashMap<String, UuidSet>
+}
+
+struct UuidSet {
+    server_uuid: String,
+    intervals: Vec<Interval>,
+}
+
+struct Interval {
+    start: u64,
+    end: u64,
 }
 
 impl fmt::Display for CapabilityFlags {
@@ -238,6 +261,38 @@ fn build_com_register_slave_cmd(server_id: u32) -> Vec<u8> {
     buf.write_u32::<LittleEndian>(0);  // master-id
 
     // fill packet header
+    let packet_len = (buf.len() - 4) as u32;
+    LittleEndian::write_u24(&mut buf, packet_len);
+    buf[3] = 0x00;  // seq_id
+
+    return buf;
+}
+
+/// https://dev.mysql.com/doc/internals/en/com-binlog-dump-gtid.html
+fn build_com_binlog_dump_gtid_cmd(server_id: u32, gtid_set: &GtidSet) -> Vec<u8> {
+    let mut buf = vec![0_u8; 4];  // 4 bytes reserved for packet header
+
+    buf.write_u8(0x1e);  // COM_BINLOG_DUMP_GTID command
+    buf.write_u16::<LittleEndian>(BinlogDumpGtidFlags::BINLOG_THROUGH_GTID.bits);
+    buf.write_u32::<LittleEndian>(server_id);
+    buf.write_u32::<LittleEndian>(0);  // binlog-filename-len = 0
+    buf.write_u64::<LittleEndian>(4);  // binlog-pos is always 4 (points to first byte after binlog file header)
+
+    let mut data_buf = vec![];
+    // mysql documentation notes that n_sids has 4 bytes length, but it is 8 bytes actually
+    data_buf.write_u64::<LittleEndian>(gtid_set.map.len() as u64);
+    for (uuid, uuid_set) in gtid_set.map.iter() {
+        data_buf.write(&hex::decode(uuid.replace("-", "")).unwrap());
+        data_buf.write_u64::<LittleEndian>(uuid_set.intervals.len() as u64);
+        for interval in uuid_set.intervals.iter() {
+            data_buf.write_u64::<LittleEndian>(interval.start);
+            data_buf.write_u64::<LittleEndian>(interval.end + 1);  // start reading next transaction
+        }
+    }
+    buf.write_u32::<LittleEndian>(data_buf.len() as u32);
+    buf.write(&data_buf);
+
+    // fill packet header TODO : extract fn
     let packet_len = (buf.len() - 4) as u32;
     LittleEndian::write_u24(&mut buf, packet_len);
     buf[3] = 0x00;  // seq_id
@@ -475,9 +530,25 @@ fn real_main() -> i32 {
 
             println!("f");
 
-            let register_slave_cmd = build_com_register_slave_cmd(2345335);
-            stream.write(&register_slave_cmd);
-            stream.read(&mut buf);
+            let mut map = LinkedHashMap::new();
+            map.insert(String::from("3785dbf8-f2f3-11ea-8114-da0aa51b98ab"), UuidSet {
+                server_uuid: String::from("3785dbf8-f2f3-11ea-8114-da0aa51b98ab"),
+                intervals: vec![Interval { start: 1, end: 29554687 }],
+            });
+            map.insert(String::from("5aeb83cb-f2f3-11ea-8737-a9bebf814aec"), UuidSet {
+                server_uuid: String::from("5aeb83cb-f2f3-11ea-8737-a9bebf814aec"),
+                intervals: vec![Interval { start: 1, end: 18548693 }],
+            });
+            let binlog_dump_gtid_cmd = build_com_binlog_dump_gtid_cmd(2345335, &GtidSet { map });
+            stream.write(&binlog_dump_gtid_cmd);
+
+            buf = vec![0_u8; MAX_MYSQL_PACKET_LEN];
+            let f = stream.read(&mut buf).unwrap();
+
+            // doesn't need to register slave
+            // let register_slave_cmd = build_com_register_slave_cmd(2345335);
+            // stream.write(&register_slave_cmd);
+            // stream.read(&mut buf);
 
             let header = parse_header(&buf);
 
