@@ -9,6 +9,8 @@ use bitflags::_core::cmp::max;
 use sha1::{Sha1, Digest};
 use std::collections::HashMap;
 use linked_hash_map::LinkedHashMap;
+use num_derive::FromPrimitive;
+use num_traits::FromPrimitive;
 
 extern crate byteorder;
 #[macro_use]
@@ -168,6 +170,80 @@ struct Handshake {
     capability_flags: CapabilityFlags,
 }
 
+/// https://dev.mysql.com/doc/internals/en/binlog-event-header.html
+struct BinlogEventHeader {
+    /// seconds since unix epoch
+    timestamp: u32,
+    /// https://dev.mysql.com/doc/internals/en/binlog-event-type.html
+    event_type: BinlogEventType,
+    /// server-id of the originating mysql-server
+    server_id: u32,
+    /// size of the event (header, post-header, body)
+    event_size: u32,
+    /// position of the next event
+    log_pos: u32,
+    /// https://dev.mysql.com/doc/internals/en/binlog-event-flag.html
+    flags: BinlogEventFlags,
+}
+
+/// https://dev.mysql.com/doc/internals/en/binlog-event-type.html
+#[allow(non_camel_case_types)]
+#[derive(FromPrimitive)]
+enum BinlogEventType {
+    UNKNOWN_EVENT = 0x00,
+    START_EVENT_V3 = 0x01,
+    QUERY_EVENT = 0x02,
+    STOP_EVENT = 0x03,
+    ROTATE_EVENT = 0x04,
+    INTVAR_EVENT = 0x05,
+    LOAD_EVENT = 0x06,
+    SLAVE_EVENT = 0x07,
+    CREATE_FILE_EVENT = 0x08,
+    APPEND_BLOCK_EVENT = 0x09,
+    EXEC_LOAD_EVENT = 0x0a,
+    DELETE_FILE_EVENT = 0x0b,
+    NEW_LOAD_EVENT = 0x0c,
+    RAND_EVENT = 0x0d,
+    USER_VAR_EVENT = 0x0e,
+    FORMAT_DESCRIPTION_EVENT = 0x0f,
+    XID_EVENT = 0x10,
+    BEGIN_LOAD_QUERY_EVENT = 0x11,
+    EXECUTE_LOAD_QUERY_EVENT = 0x12,
+    TABLE_MAP_EVENT = 0x13,
+    WRITE_ROWS_EVENTv0 = 0x14,
+    UPDATE_ROWS_EVENTv0 = 0x15,
+    DELETE_ROWS_EVENTv0 = 0x16,
+    WRITE_ROWS_EVENTv1 = 0x17,
+    UPDATE_ROWS_EVENTv1 = 0x18,
+    DELETE_ROWS_EVENTv1 = 0x19,
+    INCIDENT_EVENT = 0x1a,
+    HEARTBEAT_EVENT = 0x1b,
+    IGNORABLE_EVENT = 0x1c,
+    ROWS_QUERY_EVENT = 0x1d,
+    WRITE_ROWS_EVENTv2 = 0x1e,
+    UPDATE_ROWS_EVENTv2 = 0x1f,
+    DELETE_ROWS_EVENTv2 = 0x20,
+    GTID_EVENT = 0x21,
+    ANONYMOUS_GTID_EVENT = 0x22,
+    PREVIOUS_GTIDS_EVENT = 0x23,
+}
+
+bitflags! {
+    /// https://dev.mysql.com/doc/internals/en/binlog-event-flag.html
+    struct BinlogEventFlags : u16 {
+        const LOG_EVENT_BINLOG_IN_USE_F = 0x0001;
+        const LOG_EVENT_FORCED_ROTATE_F = 0x0002;
+        const LOG_EVENT_THREAD_SPECIFIC_F = 0x0004;
+        const LOG_EVENT_SUPPRESS_USE_F = 0x0008;
+        const LOG_EVENT_UPDATE_TABLE_MAP_VERSION_F = 0x0010;
+        const LOG_EVENT_ARTIFICIAL_F = 0x0020;
+        const LOG_EVENT_RELAY_LOG_F = 0x0040;
+        const LOG_EVENT_IGNORABLE_F = 0x0080;
+        const LOG_EVENT_NO_FILTER_F = 0x0100;
+        const LOG_EVENT_MTS_ISOLATE_F = 0x0200;
+    }
+}
+
 fn parse_null_terminated_str(buf: &[u8]) -> String {
     let mut vec = Vec::new();
     let mut i = 0;
@@ -282,7 +358,7 @@ fn build_com_binlog_dump_gtid_cmd(server_id: u32, gtid_set: &GtidSet) -> Vec<u8>
     // mysql documentation notes that n_sids has 4 bytes length, but it is 8 bytes actually
     data_buf.write_u64::<LittleEndian>(gtid_set.map.len() as u64);
     for (uuid, uuid_set) in gtid_set.map.iter() {
-        data_buf.write(&hex::decode(uuid.replace("-", "")).unwrap());
+        write_bytes(&mut data_buf, &hex::decode(uuid.replace("-", "")).unwrap());
         data_buf.write_u64::<LittleEndian>(uuid_set.intervals.len() as u64);
         for interval in uuid_set.intervals.iter() {
             data_buf.write_u64::<LittleEndian>(interval.start);
@@ -290,7 +366,7 @@ fn build_com_binlog_dump_gtid_cmd(server_id: u32, gtid_set: &GtidSet) -> Vec<u8>
         }
     }
     buf.write_u32::<LittleEndian>(data_buf.len() as u32);
-    buf.write(&data_buf);
+    write_bytes(&mut buf, &data_buf);
 
     // fill packet header TODO : extract fn
     let packet_len = (buf.len() - 4) as u32;
@@ -383,32 +459,54 @@ fn parse_header(buf: &Vec<u8>) -> PacketHeader {
 /// Returns integer value and length of parsed data in bytes
 /// Option::None is NULL value in ProtocolText::ResultsetRow context
 fn parse_length_encoded_int(buf: &[u8]) -> (Option<u64>, usize) {
-    let first_byte = buf[0];
-    return match first_byte {
-        0xfb => {
-            (Option::None, 1)
+    match buf[0] {
+        0xfb => (Option::None, 1),
+        0xfc => (Option::Some(LittleEndian::read_u16(&buf[1..]) as u64), 3),
+        0xfd => (Option::Some(LittleEndian::read_u24(&buf[1..]) as u64), 4),
+        0xfe => (Option::Some(LittleEndian::read_u64(&buf[1..])), 9),
+        0xff => panic!("unexpected 0xff prefix"),
+        _ => (Option::Some(buf[0] as u64), 1)
+    }
+}
+
+fn parse_binlog_event_header(packet: &PacketHeader) -> Result<BinlogEventHeader, GenericResponsePacket> {
+    let payload = packet.payload;
+    match payload[0] {
+        0x00 => {
+            let mut offset = 1_usize;
+
+            let timestamp = LittleEndian::read_u32(&payload[offset..]);
+            offset += 4;
+            let event_type = BinlogEventType::from_u8(payload[offset]).unwrap();
+            offset += 1;
+            let server_id = LittleEndian::read_u32(&payload[offset..]);
+            offset += 4;
+            let event_size = LittleEndian::read_u32(&payload[offset..]);
+            offset += 4;
+            let log_pos = LittleEndian::read_u32(&payload[offset..]);
+            offset += 4;
+            let flags = BinlogEventFlags::from_bits(LE::read_u16(&payload[offset..])).unwrap();
+
+            Result::Ok(BinlogEventHeader {
+                timestamp,
+                event_type,
+                server_id,
+                event_size,
+                log_pos,
+                flags,
+            })
         }
-        0xfc => {
-            (Option::Some(LittleEndian::read_u16(&buf[1..]) as u64), 3)
-        }
-        0xfd => {
-            (Option::Some(LittleEndian::read_u24(&buf[1..]) as u64), 4)
-        }
-        0xfe => {
-            (Option::Some(LittleEndian::read_u64(&buf[1..])), 9)
-        }
-        0xff => {
-            panic!("unexpected prefix")
-        }
-        _ => (Option::Some(first_byte as u64), 1)
-    };
+        0xff => Err(parse_err_packet(payload)),
+        0xfe => Err(GenericResponsePacket::Eof),
+        _ => panic!("incorrect binlog event header")
+    }
 }
 
 fn parse_generic_response(packet: &PacketHeader) -> GenericResponsePacket {
     let payload = packet.payload;
     return match payload[0] {
         0x00 => {
-            let mut offset: usize = 1;
+            let mut offset = 1_usize;
 
             let (affected_rows_opt, len) = parse_length_encoded_int(&payload[offset..]);
             offset += len;
@@ -430,31 +528,33 @@ fn parse_generic_response(packet: &PacketHeader) -> GenericResponsePacket {
                 last_insert_id,
                 status_flags,
                 warnings,
-                info,
+                info
             }
         }
-        0xff => {
-            // it is ERR packet
-            let mut offset = 1_usize;
-            let error_code = LittleEndian::read_u16(&payload[offset..]);
-            offset += 2;
-            let sql_state_marker = String::from_utf8_lossy(&payload[offset..offset + 1]).to_string();
-            offset += 1;
-            let sql_state = String::from_utf8_lossy(&payload[offset..offset + 5]).to_string();
-            offset += 5;
-            let error_message = String::from_utf8_lossy(&payload[offset..]).to_string();
-            GenericResponsePacket::Err {
-                error_code,
-                sql_state_marker,
-                sql_state,
-                error_message,
-            }
-        }
+        0xff => parse_err_packet(payload),
         0xfe => GenericResponsePacket::Eof,
-        _ => {
-            panic!("unknown packet format")
-        }
-    };
+        _ => panic!("unknown packet first byte")
+    }
+}
+
+fn parse_err_packet(payload: &[u8]) -> GenericResponsePacket {
+    assert_eq!(payload[0], 0xff);
+    //
+    let mut offset = 1_usize;
+    let error_code = LittleEndian::read_u16(&payload[offset..]);
+    offset += 2;
+    let sql_state_marker = String::from_utf8_lossy(&payload[offset..offset + 1]).to_string();
+    offset += 1;
+    let sql_state = String::from_utf8_lossy(&payload[offset..offset + 5]).to_string();
+    offset += 5;
+    let error_message = String::from_utf8_lossy(&payload[offset..]).to_string();
+    //
+    GenericResponsePacket::Err {
+        error_code,
+        sql_state_marker,
+        sql_state,
+        error_message,
+    }
 }
 
 enum GenericResponsePacket {
@@ -472,7 +572,7 @@ enum GenericResponsePacket {
         sql_state: String,
         error_message: String,
     },
-    Eof,
+    Eof
 }
 
 fn real_main() -> i32 {
@@ -508,7 +608,7 @@ fn real_main() -> i32 {
             let handshake_response = build_handshake_response(
                 &handshake,
                 &settings_map["username"],
-                &settings_map["password"]
+                &settings_map["password"],
             );
 
             stream.write(&handshake_response);
@@ -537,7 +637,7 @@ fn real_main() -> i32 {
             });
             map.insert(String::from("5aeb83cb-f2f3-11ea-8737-a9bebf814aec"), UuidSet {
                 server_uuid: String::from("5aeb83cb-f2f3-11ea-8737-a9bebf814aec"),
-                intervals: vec![Interval { start: 1, end: 18548693 }],
+                intervals: vec![Interval { start: 1, end: 19328298 }],
             });
             let binlog_dump_gtid_cmd = build_com_binlog_dump_gtid_cmd(2345335, &GtidSet { map });
             stream.write(&binlog_dump_gtid_cmd);
@@ -545,15 +645,23 @@ fn real_main() -> i32 {
             buf = vec![0_u8; MAX_MYSQL_PACKET_LEN];
             let f = stream.read(&mut buf).unwrap();
 
-            // doesn't need to register slave
+            // no need to register slave
             // let register_slave_cmd = build_com_register_slave_cmd(2345335);
             // stream.write(&register_slave_cmd);
             // stream.read(&mut buf);
 
             let header = parse_header(&buf);
 
-            let packet = parse_generic_response(&header);
-
+            //let packet = parse_generic_response(&header);
+            let event_header_result = parse_binlog_event_header(&header);
+            match &event_header_result {
+                Ok(event_heaeder) => {
+                    println!("ok binlog event");
+                }
+                Err(error_packet) => {
+                    println!("error");
+                }
+            }
 
             stream.write(&build_com_quit_cmd());
             stream.read(&mut buf);
