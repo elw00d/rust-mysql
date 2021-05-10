@@ -3,14 +3,15 @@ use std::{io, thread, mem, fmt};
 use std::time::Duration;
 use std::str::FromStr;
 use std::io::{Error, Read, Write};
-use byteorder::{ByteOrder, LittleEndian, BigEndian, WriteBytesExt, LE};
+use byteorder::{ByteOrder, LittleEndian, WriteBytesExt, LE};
 use mem::size_of;
 use bitflags::_core::cmp::max;
 use sha1::{Sha1, Digest};
-use std::collections::HashMap;
+use std::collections::{HashMap, VecDeque};
 use linked_hash_map::LinkedHashMap;
 use num_derive::FromPrimitive;
 use num_traits::FromPrimitive;
+use std::cmp::min;
 
 extern crate byteorder;
 #[macro_use]
@@ -152,10 +153,9 @@ impl fmt::Display for CapabilityFlags {
     }
 }
 
-struct PacketHeader<'a> {
+struct PacketHeader {
     payload_len: u32,
     seq_id: u8,
-    payload: &'a [u8],
 }
 
 struct Handshake {
@@ -442,17 +442,33 @@ fn sha1(bytes: &Vec<u8>) -> Vec<u8> {
     hasher.finalize().to_vec()
 }
 
-// 3 bytes for payload len, 1 byte for seq_id, 2^24 for payload
-const MAX_MYSQL_PACKET_LEN: usize = 4 + (2 << 24);
+// 3 bytes for payload len, 1 byte for seq_id
+const MYSQL_PACKET_HEADER_LEN: usize = 4;
+// https://dev.mysql.com/doc/internals/en/mysql-packet.html
+const MAX_MYSQL_PAYLOAD_LEN: usize = (2 << 24) - 1;
+// header + (2^24 - 1) for payload
+const MAX_MYSQL_PACKET_LEN: usize = MYSQL_PACKET_HEADER_LEN + MAX_MYSQL_PAYLOAD_LEN;
+const BUF_LEN: usize = MAX_MYSQL_PACKET_LEN;
 
-fn parse_header(buf: &Vec<u8>) -> PacketHeader {
+fn parse_header(buf: &[u8]) -> PacketHeader {
     let payload_len = LittleEndian::read_u24(&buf);
     let seq_id = buf[3];
-    let payload = &buf[size_of::<u32>()..size_of::<u32>() + payload_len as usize];
+    //let payload = &buf[size_of::<u32>()..size_of::<u32>() + payload_len as usize];
     return PacketHeader {
         payload_len,
         seq_id,
-        payload,
+    };
+}
+
+// TODO : rename
+fn parse_header2(slice_or_vec: SliceOrVec) -> PacketHeader {
+    return match slice_or_vec {
+        SliceOrVec::Vec(v) => {
+            parse_header(&v)
+        }
+        SliceOrVec::Slice(sl) => {
+            parse_header(sl)
+        }
     };
 }
 
@@ -469,8 +485,8 @@ fn parse_length_encoded_int(buf: &[u8]) -> (Option<u64>, usize) {
     }
 }
 
-fn parse_binlog_event_header(packet: &PacketHeader) -> Result<BinlogEventHeader, GenericResponsePacket> {
-    let payload = packet.payload;
+fn parse_binlog_event_header(payload: &[u8]) -> Result<BinlogEventHeader, GenericResponsePacket> {
+    //let payload = packet.payload;
     match payload[0] {
         0x00 => {
             let mut offset = 1_usize;
@@ -502,8 +518,8 @@ fn parse_binlog_event_header(packet: &PacketHeader) -> Result<BinlogEventHeader,
     }
 }
 
-fn parse_generic_response(packet: &PacketHeader) -> GenericResponsePacket {
-    let payload = packet.payload;
+fn parse_generic_response(payload: &[u8]) -> GenericResponsePacket {
+    //let payload = packet.payload;
     return match payload[0] {
         0x00 => {
             let mut offset = 1_usize;
@@ -528,13 +544,13 @@ fn parse_generic_response(packet: &PacketHeader) -> GenericResponsePacket {
                 last_insert_id,
                 status_flags,
                 warnings,
-                info
+                info,
             }
         }
         0xff => parse_err_packet(payload),
         0xfe => GenericResponsePacket::Eof,
         _ => panic!("unknown packet first byte")
-    }
+    };
 }
 
 fn parse_err_packet(payload: &[u8]) -> GenericResponsePacket {
@@ -572,7 +588,302 @@ enum GenericResponsePacket {
         sql_state: String,
         error_message: String,
     },
-    Eof
+    Eof,
+}
+
+struct BinLogClient {
+    server_addr: SocketAddr,
+    username: String,
+    password: String,
+    tcp_stream: Option<TcpStream>,
+    gtid_set: GtidSet,
+    is_connected: bool,
+    events_handler: fn(BinlogEventHeader) -> (),
+
+    buffers: VecDeque<Vec<u8>>,
+    /// points to the next mysql packet
+    offset: usize,
+    /// size of data was read into buffers
+    size: usize,
+    // todo
+    //temp_buffers: Vec<Vec<u8>>,
+}
+
+enum SliceOrVec<'a> {
+    Slice(&'a [u8]),
+    Vec(Vec::<u8>),
+}
+
+impl BinLogClient {
+    fn new(server_addr: SocketAddr,
+           username: &str,
+           password: &str,
+           gtid_set: GtidSet,
+           events_handler: fn(BinlogEventHeader),
+    ) -> BinLogClient {
+        BinLogClient {
+            server_addr,
+            username: username.to_string(),
+            password: password.to_string(),
+            tcp_stream: None,
+            gtid_set,
+            is_connected: false,
+            events_handler,
+            buffers: VecDeque::new(),
+            offset: 0,
+            size: 0,
+            //temp_buffers: Vec::new(),
+        }
+    }
+
+    fn connect(&mut self, timeout: Duration) -> io::Result<()> {
+        if self.is_connected {
+            print!("already connected");
+
+            return Ok(());
+        }
+
+        let result: io::Result<TcpStream> = TcpStream::connect_timeout(&self.server_addr, timeout);
+        match result {
+            Ok(mut stream) => {
+                self.tcp_stream = Some(stream);
+
+                // todo: avoid cloning ?
+                let username = self.username.clone();
+                let password = self.password.clone();
+
+                {
+                    let handshake_packet = self.read_packet();
+
+                    let payload: &[u8];
+                    match &handshake_packet {
+                        SliceOrVec::Slice(sl) => payload = sl,
+                        SliceOrVec::Vec(v) => payload = v.as_slice(),
+                    }
+
+                    let handshake = parse_handshake(payload);
+                    println!("{}", handshake.capability_flags);
+
+                    if !handshake.capability_flags.intersects(CapabilityFlags::CLIENT_PROTOCOL_41) {
+                        panic!("server does not support CLIENT_PROTOCOL_41")
+                    }
+                    if handshake.auth_plugin_name != "mysql_native_password" {
+                        panic!("unsupported auth method")
+                    }
+
+                    let handshake_response = build_handshake_response(
+                        &handshake,
+                        &username,
+                        &password,
+                    );
+
+                    self.tcp_stream.as_ref().unwrap().write(&handshake_response);
+                }
+
+                {
+                    let packet = self.read_packet();
+                    let payload: &[u8];
+                    match &packet {
+                        SliceOrVec::Slice(sl) => payload = sl,
+                        SliceOrVec::Vec(v) => payload = v.as_slice(),
+                    }
+
+                    let packet = parse_generic_response(payload);
+
+                    match packet {
+                        GenericResponsePacket::Err { error_code, sql_state_marker, sql_state, error_message } => {
+                            println!("{}", error_message);
+                            // TODO
+                            //return 1;
+                        }
+                        GenericResponsePacket::Eof => panic!("unexpected eof"),
+                        _ => {}
+                    }
+
+                    println!("connected");
+                }
+
+                {
+                    // TODO : server_id
+                    let binlog_dump_gtid_cmd = build_com_binlog_dump_gtid_cmd(2345335, &self.gtid_set);
+                    self.tcp_stream.as_ref().unwrap().write(&binlog_dump_gtid_cmd);
+
+                    loop {
+                        let packet = self.read_packet();
+                        let payload: &[u8];
+                        match &packet {
+                            SliceOrVec::Slice(sl) => payload = sl,
+                            SliceOrVec::Vec(v) => payload = v.as_slice(),
+                        }
+
+                        //let packet = parse_generic_response(&header);
+                        let event_header_result = parse_binlog_event_header(&payload);
+                        match event_header_result {
+                            Ok(event_header) => {
+                                println!("ok binlog event");
+
+                                let events_hander = self.events_handler;
+                                events_hander(event_header);
+                            }
+                            Err(error_packet) => {
+                                println!("error");
+                            }
+                        }
+
+                        self.cleanup();
+                    }
+
+                    //stream.write(&build_com_quit_cmd());
+                    //stream.read(&mut buf);
+                }
+
+                self.is_connected = true;
+            }
+            Err(e) => return Err(e),
+        }
+
+        return Ok(());
+        // TODO : connect
+    }
+
+    fn get_data(&self, offset: usize, size: usize) -> SliceOrVec {
+        let start_buffer_index = offset / BUF_LEN;
+        let end_buffer_index = (offset + size - 1) / BUF_LEN;
+        if start_buffer_index == end_buffer_index {
+            let buf = self.buffers.get(start_buffer_index).unwrap();
+            let i = (offset % BUF_LEN);
+            let j = ((offset + size - 1) % BUF_LEN) + 1;
+            return SliceOrVec::Slice(&buf[i..j]);
+        }
+        let mut tmp_buf = Vec::<u8>::with_capacity(size);
+        let mut remaining_size = size;
+        let mut current_offset = offset;
+        while remaining_size > 0 {
+            let buffer_index = current_offset / BUF_LEN;
+            let offset_in_buffer = current_offset % BUF_LEN;
+            let bytes_available_in_buffer = BUF_LEN - offset_in_buffer;
+            let bytes_take = min(bytes_available_in_buffer, remaining_size);
+
+            let buffer = self.buffers.get(buffer_index).unwrap();
+            tmp_buf.extend_from_slice(&buffer[offset_in_buffer..offset_in_buffer + bytes_take]);
+
+            current_offset += bytes_take;
+            remaining_size -= bytes_take;
+        }
+        //self.temp_buffers.push(tmp_buf);
+        //return &self.temp_buffers.last().unwrap();
+        return SliceOrVec::Vec(tmp_buf);
+    }
+
+    fn read_packet(&mut self) -> SliceOrVec {
+        //while self.buffers.is_empty() {
+        //    self.buffers.push_back(vec![0_u8; MAX_MYSQL_PACKET_LEN]);
+        //}
+        // TODO : timeout
+
+        while self.need_more_data() {
+            let buffer_index = self.size / BUF_LEN;
+            if buffer_index >= self.buffers.len() {
+                self.buffers.push_back(vec![0_u8; MAX_MYSQL_PACKET_LEN]);
+            }
+            // let remaining_size_in_buf = BUF_LEN - (self.size % BUF_LEN);
+            // if remaining_size_in_buf == 0 {
+            //     self.buffers.push_back(Vec::with_capacity(BUF_LEN));
+            //     remaining_size_in_buf = BUF_LEN;
+            // }
+
+            let buf = self.buffers.get_mut(buffer_index).unwrap();
+            let read_result = self.tcp_stream.as_ref().unwrap().read(&mut buf[self.size % BUF_LEN..]);
+            match read_result {
+                Ok(read) => {
+                    self.size += read;
+                }
+                Err(e) => {
+                    // TODO
+                }
+            }
+        }
+
+        // Read whole packet data
+        let header = parse_header2(self.get_data(self.offset, MYSQL_PACKET_HEADER_LEN));
+        if (header.payload_len as usize) < MAX_MYSQL_PAYLOAD_LEN {
+            // single packet: reading without copying
+            // (nevertheless, copying may be done by self.get_data() at border between buffers)
+            let offset = self.offset;
+            self.offset += MYSQL_PACKET_HEADER_LEN + header.payload_len as usize;
+            let result = self.get_data(offset + MYSQL_PACKET_HEADER_LEN, header.payload_len as usize);
+            return result;
+            // return match res {
+            //     SliceOrVec::Slice(sl) => {
+            //         sl
+            //     }
+            //     SliceOrVec::Vec(v) => {
+            //         self.temp_buffers.push(v);
+            //         self.temp_buffers.last().unwrap()
+            //     }
+            // }
+        } else {
+            // split packet: combining them into 1 vec
+            let mut tmp_buf = Vec::new();
+
+            let mut offset = self.offset;
+            let mut found_packet_end = false;
+            while !found_packet_end {
+                let header = parse_header2(self.get_data(offset, MYSQL_PACKET_HEADER_LEN));
+                let data = self.get_data(offset + MYSQL_PACKET_HEADER_LEN, header.payload_len as usize);
+
+                match data {
+                    SliceOrVec::Slice(sl) => {
+                        tmp_buf.extend_from_slice(sl);
+                    }
+                    SliceOrVec::Vec(v) => {
+                        tmp_buf.extend_from_slice(&v);
+                        //self.temp_buffers.push(v);
+                    }
+                }
+
+                //tmp_buf.extend_from_slice(data);
+                if (header.payload_len as usize) < MAX_MYSQL_PAYLOAD_LEN {
+                    found_packet_end = true;
+                }
+                offset += MYSQL_PACKET_HEADER_LEN + header.payload_len as usize;
+            }
+
+            //self.temp_buffers.push(tmp_buf);
+            self.offset = offset;
+            return SliceOrVec::Vec(tmp_buf);
+        }
+    }
+
+    fn cleanup(&mut self) {
+        // TODO : remove processed buffers from head
+    }
+
+    fn need_more_data(&self) -> bool {
+        let mut offset = self.offset;
+        let mut found_packet_end = false;
+        while !found_packet_end {
+            if offset + MYSQL_PACKET_HEADER_LEN > self.size {
+                return true;
+            }
+            let next_header_data = self.get_data(offset, MYSQL_PACKET_HEADER_LEN);
+            let header = parse_header2(next_header_data);
+            if (header.payload_len as usize) < MAX_MYSQL_PAYLOAD_LEN {
+                found_packet_end = true;
+            }
+            offset += MYSQL_PACKET_HEADER_LEN + header.payload_len as usize;
+        }
+        return offset - 1 > self.size;
+    }
+
+    fn disconnect(&mut self) {
+        // TODO :
+        self.is_connected = false;
+    }
+}
+
+fn handler(event: BinlogEventHeader) {
+    println!("binlog event {}", event.event_type as u8);
 }
 
 fn real_main() -> i32 {
@@ -584,98 +895,120 @@ fn real_main() -> i32 {
 
     let result = settings_map["address"].to_socket_addrs();
     let server: Vec<SocketAddr> = result.expect("Unable to resolve").collect();
-    let result: io::Result<TcpStream> = TcpStream::connect_timeout(
-        server.get(0).expect(""),
-        Duration::from_secs(5));
-    match result {
-        Ok(mut stream) => {
-            let mut buf = vec![0_u8; MAX_MYSQL_PACKET_LEN];
 
-            stream.read(&mut buf);
-            let payload_len = LittleEndian::read_u24(&buf);
-            let seq_id = buf[3];
-            let payload = &buf[size_of::<u32>()..size_of::<u32>() + payload_len as usize];
-            let handshake = parse_handshake(payload);
-            println!("{}", handshake.capability_flags);
+    let socket_addr = server.get(0).expect("");
 
-            if !handshake.capability_flags.intersects(CapabilityFlags::CLIENT_PROTOCOL_41) {
-                panic!("CLIENT_PROTOCOL_41 is not supported")
-            }
-            if handshake.auth_plugin_name != "mysql_native_password" {
-                panic!("Unsupported auth method")
-            }
-
-            let handshake_response = build_handshake_response(
-                &handshake,
-                &settings_map["username"],
-                &settings_map["password"],
-            );
-
-            stream.write(&handshake_response);
-
-            stream.read(&mut buf);
-
-            let header = parse_header(&buf);
-
-            let packet = parse_generic_response(&header);
-
-            match packet {
-                GenericResponsePacket::Err { error_code, sql_state_marker, sql_state, error_message } => {
-                    println!("{}", error_message);
-                    return 1;
-                }
-                GenericResponsePacket::Eof => panic!("unexpected eof"),
-                _ => {}
-            }
-
-            println!("f");
-
-            let mut map = LinkedHashMap::new();
-            map.insert(String::from("3785dbf8-f2f3-11ea-8114-da0aa51b98ab"), UuidSet {
-                server_uuid: String::from("3785dbf8-f2f3-11ea-8114-da0aa51b98ab"),
-                intervals: vec![Interval { start: 1, end: 29554687 }],
-            });
-            map.insert(String::from("5aeb83cb-f2f3-11ea-8737-a9bebf814aec"), UuidSet {
-                server_uuid: String::from("5aeb83cb-f2f3-11ea-8737-a9bebf814aec"),
-                intervals: vec![Interval { start: 1, end: 19328298 }],
-            });
-            let binlog_dump_gtid_cmd = build_com_binlog_dump_gtid_cmd(2345335, &GtidSet { map });
-            stream.write(&binlog_dump_gtid_cmd);
-
-            buf = vec![0_u8; MAX_MYSQL_PACKET_LEN];
-            let f = stream.read(&mut buf).unwrap();
-
-            // no need to register slave
-            // let register_slave_cmd = build_com_register_slave_cmd(2345335);
-            // stream.write(&register_slave_cmd);
-            // stream.read(&mut buf);
-
-            let header = parse_header(&buf);
-
-            //let packet = parse_generic_response(&header);
-            let event_header_result = parse_binlog_event_header(&header);
-            match &event_header_result {
-                Ok(event_heaeder) => {
-                    println!("ok binlog event");
-                }
-                Err(error_packet) => {
-                    println!("error");
-                }
-            }
-
-            stream.write(&build_com_quit_cmd());
-            stream.read(&mut buf);
-
-            let header = parse_header(&buf);
-
-            let packet = parse_generic_response(&header);
-
-            println!("fff");
-        }
-        Err(e) => {
-            println!("Failed to connect: {}", e)
-        }
+    {
+        let mut map = LinkedHashMap::new();
+        map.insert(String::from("3785dbf8-f2f3-11ea-8114-da0aa51b98ab"), UuidSet {
+            server_uuid: String::from("3785dbf8-f2f3-11ea-8114-da0aa51b98ab"),
+            intervals: vec![Interval { start: 1, end: 29554687 }],
+        });
+        map.insert(String::from("5aeb83cb-f2f3-11ea-8737-a9bebf814aec"), UuidSet {
+            server_uuid: String::from("5aeb83cb-f2f3-11ea-8737-a9bebf814aec"),
+            intervals: vec![Interval { start: 1, end: 19328298 }],
+        });
+        let mut client = BinLogClient::new(socket_addr.clone(),
+                                           &settings_map["username"],
+                                           &settings_map["password"],
+                                           GtidSet { map },
+                                           handler,
+        );
+        client.connect(Duration::from_secs(5));
     }
+
+    // let result: io::Result<TcpStream> = TcpStream::connect_timeout(
+    //     server.get(0).expect(""),
+    //     Duration::from_secs(5));
+    // match result {
+    //     Ok(mut stream) => {
+    //         let mut buf = vec![0_u8; MAX_MYSQL_PACKET_LEN];
+    //
+    //         stream.read(&mut buf);
+    //         let payload_len = LittleEndian::read_u24(&buf);
+    //         let seq_id = buf[3];
+    //         let payload = &buf[size_of::<u32>()..size_of::<u32>() + payload_len as usize];
+    //         let handshake = parse_handshake(payload);
+    //         println!("{}", handshake.capability_flags);
+    //
+    //         if !handshake.capability_flags.intersects(CapabilityFlags::CLIENT_PROTOCOL_41) {
+    //             panic!("CLIENT_PROTOCOL_41 is not supported")
+    //         }
+    //         if handshake.auth_plugin_name != "mysql_native_password" {
+    //             panic!("Unsupported auth method")
+    //         }
+    //
+    //         let handshake_response = build_handshake_response(
+    //             &handshake,
+    //             &settings_map["username"],
+    //             &settings_map["password"],
+    //         );
+    //
+    //         stream.write(&handshake_response);
+    //
+    //         stream.read(&mut buf);
+    //
+    //         let header = parse_header(&buf);
+    //
+    //         let packet = parse_generic_response(&buf[4..]);
+    //
+    //         match packet {
+    //             GenericResponsePacket::Err { error_code, sql_state_marker, sql_state, error_message } => {
+    //                 println!("{}", error_message);
+    //                 return 1;
+    //             }
+    //             GenericResponsePacket::Eof => panic!("unexpected eof"),
+    //             _ => {}
+    //         }
+    //
+    //         println!("f");
+    //
+    //         let mut map = LinkedHashMap::new();
+    //         map.insert(String::from("3785dbf8-f2f3-11ea-8114-da0aa51b98ab"), UuidSet {
+    //             server_uuid: String::from("3785dbf8-f2f3-11ea-8114-da0aa51b98ab"),
+    //             intervals: vec![Interval { start: 1, end: 29554687 }],
+    //         });
+    //         map.insert(String::from("5aeb83cb-f2f3-11ea-8737-a9bebf814aec"), UuidSet {
+    //             server_uuid: String::from("5aeb83cb-f2f3-11ea-8737-a9bebf814aec"),
+    //             intervals: vec![Interval { start: 1, end: 19328298 }],
+    //         });
+    //         let binlog_dump_gtid_cmd = build_com_binlog_dump_gtid_cmd(2345335, &GtidSet { map });
+    //         stream.write(&binlog_dump_gtid_cmd);
+    //
+    //         buf = vec![0_u8; MAX_MYSQL_PACKET_LEN];
+    //         let f = stream.read(&mut buf).unwrap();
+    //
+    //         // no need to register slave
+    //         // let register_slave_cmd = build_com_register_slave_cmd(2345335);
+    //         // stream.write(&register_slave_cmd);
+    //         // stream.read(&mut buf);
+    //
+    //         let header = parse_header(&buf);
+    //
+    //         //let packet = parse_generic_response(&header);
+    //         let event_header_result = parse_binlog_event_header(&buf[4..]);
+    //         match &event_header_result {
+    //             Ok(event_heaeder) => {
+    //                 println!("ok binlog event");
+    //             }
+    //             Err(error_packet) => {
+    //                 println!("error");
+    //             }
+    //         }
+    //
+    //         stream.write(&build_com_quit_cmd());
+    //         stream.read(&mut buf);
+    //
+    //         let header = parse_header(&buf);
+    //
+    //         let packet = parse_generic_response(&buf[4..]);
+    //
+    //         println!("fff");
+    //     }
+    //     Err(e) => {
+    //         println!("Failed to connect: {}", e)
+    //     }
+    // }
     println!("Hello, world!");
     0
 }
