@@ -389,6 +389,21 @@ fn build_com_quit_cmd() -> Vec<u8> {
     return buf;
 }
 
+fn build_com_query_cmd(query: &str) -> Vec<u8> {
+    let mut buf = vec![0_u8; 4];  // 4 bytes reserved for packet header
+
+    buf.write_u8(0x03);  // COM_QUERY
+
+    write_null_terminated_str(&mut buf, query);
+
+    // fill packet header
+    let packet_len = (buf.len() - 4) as u32;
+    LittleEndian::write_u24(&mut buf, packet_len);
+    buf[3] = 0x00;  // seq_id
+
+    return buf;
+}
+
 fn build_handshake_response(handshake: &Handshake, username: &str, password: &str) -> Vec<u8> {
     let mut buf = vec![0_u8; 4];  // 4 bytes reserved for packet header
 
@@ -697,6 +712,22 @@ impl BinLogClient {
                 }
 
                 {
+                    let com_query_cmd = build_com_query_cmd("set @master_binlog_checksum = @@global.binlog_checksum");
+                    self.tcp_stream.as_ref().unwrap().write(&com_query_cmd);
+
+                    let packet = self.read_packet();
+                    let payload: Vec<u8>;
+                    match &packet {
+                        SliceOrVec::Slice(sl) => payload = sl.to_vec(),
+                        SliceOrVec::Vec(v) => payload = v.clone(),
+                    }
+                    // TODO : parse COM_QUERY result ?
+                    if payload[0] == 0xff {
+                        println!("error");
+                    }
+                }
+
+                {
                     // TODO : server_id
                     let binlog_dump_gtid_cmd = build_com_binlog_dump_gtid_cmd(2345335, &self.gtid_set);
                     self.tcp_stream.as_ref().unwrap().write(&binlog_dump_gtid_cmd);
@@ -874,7 +905,7 @@ fn real_main() -> i32 {
         });
         map.insert(String::from("5aeb83cb-f2f3-11ea-8737-a9bebf814aec"), UuidSet {
             server_uuid: String::from("5aeb83cb-f2f3-11ea-8737-a9bebf814aec"),
-            intervals: vec![Interval { start: 1, end: 19328298 }],
+            intervals: vec![Interval { start: 1, end: 21940038 }],
         });
         let mut client = BinLogClient::new(socket_addr.clone(),
                                            &settings_map["username"],
