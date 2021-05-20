@@ -450,24 +450,22 @@ const MAX_MYSQL_PAYLOAD_LEN: usize = (2 << 24) - 1;
 const MAX_MYSQL_PACKET_LEN: usize = MYSQL_PACKET_HEADER_LEN + MAX_MYSQL_PAYLOAD_LEN;
 const BUF_LEN: usize = MAX_MYSQL_PACKET_LEN;
 
-fn parse_header(buf: &[u8]) -> PacketHeader {
+fn parse_header_from_buf(buf: &[u8]) -> PacketHeader {
     let payload_len = LittleEndian::read_u24(&buf);
     let seq_id = buf[3];
-    //let payload = &buf[size_of::<u32>()..size_of::<u32>() + payload_len as usize];
     return PacketHeader {
         payload_len,
         seq_id,
     };
 }
 
-// TODO : rename
-fn parse_header2(slice_or_vec: SliceOrVec) -> PacketHeader {
+fn parse_header_from_slice_or_vec(slice_or_vec: SliceOrVec) -> PacketHeader {
     return match slice_or_vec {
         SliceOrVec::Vec(v) => {
-            parse_header(&v)
+            parse_header_from_buf(&v)
         }
         SliceOrVec::Slice(sl) => {
-            parse_header(sl)
+            parse_header_from_buf(sl)
         }
     };
 }
@@ -486,7 +484,6 @@ fn parse_length_encoded_int(buf: &[u8]) -> (Option<u64>, usize) {
 }
 
 fn parse_binlog_event_header(payload: &[u8]) -> Result<BinlogEventHeader, GenericResponsePacket> {
-    //let payload = packet.payload;
     match payload[0] {
         0x00 => {
             let mut offset = 1_usize;
@@ -519,7 +516,6 @@ fn parse_binlog_event_header(payload: &[u8]) -> Result<BinlogEventHeader, Generi
 }
 
 fn parse_generic_response(payload: &[u8]) -> GenericResponsePacket {
-    //let payload = packet.payload;
     return match payload[0] {
         0x00 => {
             let mut offset = 1_usize;
@@ -605,8 +601,6 @@ struct BinLogClient {
     offset: usize,
     /// size of data was read into buffers
     size: usize,
-    // todo
-    //temp_buffers: Vec<Vec<u8>>,
 }
 
 enum SliceOrVec<'a> {
@@ -632,7 +626,6 @@ impl BinLogClient {
             buffers: VecDeque::new(),
             offset: 0,
             size: 0,
-            //temp_buffers: Vec::new(),
         }
     }
 
@@ -716,7 +709,6 @@ impl BinLogClient {
                             SliceOrVec::Vec(v) => payload = v.as_slice(),
                         }
 
-                        //let packet = parse_generic_response(&header);
                         let event_header_result = parse_binlog_event_header(&payload);
                         match event_header_result {
                             Ok(event_header) => {
@@ -727,6 +719,7 @@ impl BinLogClient {
                             }
                             Err(error_packet) => {
                                 println!("error");
+                                break;
                             }
                         }
 
@@ -770,28 +763,16 @@ impl BinLogClient {
             current_offset += bytes_take;
             remaining_size -= bytes_take;
         }
-        //self.temp_buffers.push(tmp_buf);
-        //return &self.temp_buffers.last().unwrap();
         return SliceOrVec::Vec(tmp_buf);
     }
 
     fn read_packet(&mut self) -> SliceOrVec {
-        //while self.buffers.is_empty() {
-        //    self.buffers.push_back(vec![0_u8; MAX_MYSQL_PACKET_LEN]);
-        //}
         // TODO : timeout
-
         while self.need_more_data() {
             let buffer_index = self.size / BUF_LEN;
             if buffer_index >= self.buffers.len() {
                 self.buffers.push_back(vec![0_u8; MAX_MYSQL_PACKET_LEN]);
             }
-            // let remaining_size_in_buf = BUF_LEN - (self.size % BUF_LEN);
-            // if remaining_size_in_buf == 0 {
-            //     self.buffers.push_back(Vec::with_capacity(BUF_LEN));
-            //     remaining_size_in_buf = BUF_LEN;
-            // }
-
             let buf = self.buffers.get_mut(buffer_index).unwrap();
             let read_result = self.tcp_stream.as_ref().unwrap().read(&mut buf[self.size % BUF_LEN..]);
             match read_result {
@@ -805,23 +786,13 @@ impl BinLogClient {
         }
 
         // Read whole packet data
-        let header = parse_header2(self.get_data(self.offset, MYSQL_PACKET_HEADER_LEN));
+        let header = parse_header_from_slice_or_vec(self.get_data(self.offset, MYSQL_PACKET_HEADER_LEN));
         if (header.payload_len as usize) < MAX_MYSQL_PAYLOAD_LEN {
             // single packet: reading without copying
             // (nevertheless, copying may be done by self.get_data() at border between buffers)
             let offset = self.offset;
             self.offset += MYSQL_PACKET_HEADER_LEN + header.payload_len as usize;
-            let result = self.get_data(offset + MYSQL_PACKET_HEADER_LEN, header.payload_len as usize);
-            return result;
-            // return match res {
-            //     SliceOrVec::Slice(sl) => {
-            //         sl
-            //     }
-            //     SliceOrVec::Vec(v) => {
-            //         self.temp_buffers.push(v);
-            //         self.temp_buffers.last().unwrap()
-            //     }
-            // }
+            return self.get_data(offset + MYSQL_PACKET_HEADER_LEN, header.payload_len as usize);
         } else {
             // split packet: combining them into 1 vec
             let mut tmp_buf = Vec::new();
@@ -829,7 +800,7 @@ impl BinLogClient {
             let mut offset = self.offset;
             let mut found_packet_end = false;
             while !found_packet_end {
-                let header = parse_header2(self.get_data(offset, MYSQL_PACKET_HEADER_LEN));
+                let header = parse_header_from_slice_or_vec(self.get_data(offset, MYSQL_PACKET_HEADER_LEN));
                 let data = self.get_data(offset + MYSQL_PACKET_HEADER_LEN, header.payload_len as usize);
 
                 match data {
@@ -838,18 +809,15 @@ impl BinLogClient {
                     }
                     SliceOrVec::Vec(v) => {
                         tmp_buf.extend_from_slice(&v);
-                        //self.temp_buffers.push(v);
                     }
                 }
 
-                //tmp_buf.extend_from_slice(data);
                 if (header.payload_len as usize) < MAX_MYSQL_PAYLOAD_LEN {
                     found_packet_end = true;
                 }
                 offset += MYSQL_PACKET_HEADER_LEN + header.payload_len as usize;
             }
 
-            //self.temp_buffers.push(tmp_buf);
             self.offset = offset;
             return SliceOrVec::Vec(tmp_buf);
         }
@@ -867,7 +835,7 @@ impl BinLogClient {
                 return true;
             }
             let next_header_data = self.get_data(offset, MYSQL_PACKET_HEADER_LEN);
-            let header = parse_header2(next_header_data);
+            let header = parse_header_from_slice_or_vec(next_header_data);
             if (header.payload_len as usize) < MAX_MYSQL_PAYLOAD_LEN {
                 found_packet_end = true;
             }
@@ -917,98 +885,6 @@ fn real_main() -> i32 {
         client.connect(Duration::from_secs(5));
     }
 
-    // let result: io::Result<TcpStream> = TcpStream::connect_timeout(
-    //     server.get(0).expect(""),
-    //     Duration::from_secs(5));
-    // match result {
-    //     Ok(mut stream) => {
-    //         let mut buf = vec![0_u8; MAX_MYSQL_PACKET_LEN];
-    //
-    //         stream.read(&mut buf);
-    //         let payload_len = LittleEndian::read_u24(&buf);
-    //         let seq_id = buf[3];
-    //         let payload = &buf[size_of::<u32>()..size_of::<u32>() + payload_len as usize];
-    //         let handshake = parse_handshake(payload);
-    //         println!("{}", handshake.capability_flags);
-    //
-    //         if !handshake.capability_flags.intersects(CapabilityFlags::CLIENT_PROTOCOL_41) {
-    //             panic!("CLIENT_PROTOCOL_41 is not supported")
-    //         }
-    //         if handshake.auth_plugin_name != "mysql_native_password" {
-    //             panic!("Unsupported auth method")
-    //         }
-    //
-    //         let handshake_response = build_handshake_response(
-    //             &handshake,
-    //             &settings_map["username"],
-    //             &settings_map["password"],
-    //         );
-    //
-    //         stream.write(&handshake_response);
-    //
-    //         stream.read(&mut buf);
-    //
-    //         let header = parse_header(&buf);
-    //
-    //         let packet = parse_generic_response(&buf[4..]);
-    //
-    //         match packet {
-    //             GenericResponsePacket::Err { error_code, sql_state_marker, sql_state, error_message } => {
-    //                 println!("{}", error_message);
-    //                 return 1;
-    //             }
-    //             GenericResponsePacket::Eof => panic!("unexpected eof"),
-    //             _ => {}
-    //         }
-    //
-    //         println!("f");
-    //
-    //         let mut map = LinkedHashMap::new();
-    //         map.insert(String::from("3785dbf8-f2f3-11ea-8114-da0aa51b98ab"), UuidSet {
-    //             server_uuid: String::from("3785dbf8-f2f3-11ea-8114-da0aa51b98ab"),
-    //             intervals: vec![Interval { start: 1, end: 29554687 }],
-    //         });
-    //         map.insert(String::from("5aeb83cb-f2f3-11ea-8737-a9bebf814aec"), UuidSet {
-    //             server_uuid: String::from("5aeb83cb-f2f3-11ea-8737-a9bebf814aec"),
-    //             intervals: vec![Interval { start: 1, end: 19328298 }],
-    //         });
-    //         let binlog_dump_gtid_cmd = build_com_binlog_dump_gtid_cmd(2345335, &GtidSet { map });
-    //         stream.write(&binlog_dump_gtid_cmd);
-    //
-    //         buf = vec![0_u8; MAX_MYSQL_PACKET_LEN];
-    //         let f = stream.read(&mut buf).unwrap();
-    //
-    //         // no need to register slave
-    //         // let register_slave_cmd = build_com_register_slave_cmd(2345335);
-    //         // stream.write(&register_slave_cmd);
-    //         // stream.read(&mut buf);
-    //
-    //         let header = parse_header(&buf);
-    //
-    //         //let packet = parse_generic_response(&header);
-    //         let event_header_result = parse_binlog_event_header(&buf[4..]);
-    //         match &event_header_result {
-    //             Ok(event_heaeder) => {
-    //                 println!("ok binlog event");
-    //             }
-    //             Err(error_packet) => {
-    //                 println!("error");
-    //             }
-    //         }
-    //
-    //         stream.write(&build_com_quit_cmd());
-    //         stream.read(&mut buf);
-    //
-    //         let header = parse_header(&buf);
-    //
-    //         let packet = parse_generic_response(&buf[4..]);
-    //
-    //         println!("fff");
-    //     }
-    //     Err(e) => {
-    //         println!("Failed to connect: {}", e)
-    //     }
-    // }
     println!("Hello, world!");
     0
 }
