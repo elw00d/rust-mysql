@@ -58,7 +58,7 @@ bitflags! {
 
 /// https://dev.mysql.com/doc/refman/5.6/en/replication-gtids-concepts.html
 struct GtidSet {
-    map: LinkedHashMap<String, UuidSet>
+    map: LinkedHashMap<String, UuidSet>,
 }
 
 struct UuidSet {
@@ -417,7 +417,6 @@ fn build_handshake_response(handshake: &Handshake, username: &str, password: &st
     buf.write(&vec![0_u8; 23]);  // reserved
     write_null_terminated_str(&mut buf, username);
 
-    let password = password;
     let scrambled_password = scramble_password(password, &handshake.auth_plugin_data[0..20].to_vec());
 
     buf.write_u8(scrambled_password.len() as u8);
@@ -656,10 +655,6 @@ impl BinLogClient {
             Ok(mut stream) => {
                 self.tcp_stream = Some(stream);
 
-                // todo: avoid cloning ?
-                let username = self.username.clone();
-                let password = self.password.clone();
-
                 {
                     let handshake_packet = self.read_packet();
 
@@ -681,8 +676,8 @@ impl BinLogClient {
 
                     let handshake_response = build_handshake_response(
                         &handshake,
-                        &username,
-                        &password,
+                        &self.username,
+                        &self.password,
                     );
 
                     self.tcp_stream.as_ref().unwrap().write(&handshake_response);
@@ -711,6 +706,10 @@ impl BinLogClient {
                     println!("connected");
                 }
 
+                // MySQL master can add CRC32 checksums to binlog events (this is the default behavior since version 5.6.6)
+                // The slave should confirm that it is able to handle them
+                // Otherwise, the master will send the error:
+                // "Slave can not handle replication events with the checksum that master is configured to log"
                 {
                     let com_query_cmd = build_com_query_cmd("set @master_binlog_checksum = @@global.binlog_checksum");
                     self.tcp_stream.as_ref().unwrap().write(&com_query_cmd);
@@ -802,7 +801,7 @@ impl BinLogClient {
         while self.need_more_data() {
             let buffer_index = self.size / BUF_LEN;
             if buffer_index >= self.buffers.len() {
-                self.buffers.push_back(vec![0_u8; MAX_MYSQL_PACKET_LEN]);
+                self.buffers.push_back(vec![0_u8; BUF_LEN]);
             }
             let buf = self.buffers.get_mut(buffer_index).unwrap();
             let read_result = self.tcp_stream.as_ref().unwrap().read(&mut buf[self.size % BUF_LEN..]);
@@ -899,13 +898,13 @@ fn real_main() -> i32 {
 
     {
         let mut map = LinkedHashMap::new();
-        map.insert(String::from("3785dbf8-f2f3-11ea-8114-da0aa51b98ab"), UuidSet {
-            server_uuid: String::from("3785dbf8-f2f3-11ea-8114-da0aa51b98ab"),
-            intervals: vec![Interval { start: 1, end: 29554687 }],
+        map.insert(String::from("1b8ef66e-f31a-11ea-968f-0bed86d59b89"), UuidSet {
+            server_uuid: String::from("1b8ef66e-f31a-11ea-968f-0bed86d59b89"),
+            intervals: vec![Interval { start: 1, end: 345822653 }],
         });
-        map.insert(String::from("5aeb83cb-f2f3-11ea-8737-a9bebf814aec"), UuidSet {
-            server_uuid: String::from("5aeb83cb-f2f3-11ea-8737-a9bebf814aec"),
-            intervals: vec![Interval { start: 1, end: 21940038 }],
+        map.insert(String::from("fad9b072-f319-11ea-a6e2-6fae1c7e284a"), UuidSet {
+            server_uuid: String::from("fad9b072-f319-11ea-a6e2-6fae1c7e284a"),
+            intervals: vec![Interval { start: 1, end: 227699223 }],
         });
         let mut client = BinLogClient::new(socket_addr.clone(),
                                            &settings_map["username"],
