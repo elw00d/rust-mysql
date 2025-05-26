@@ -1,4 +1,4 @@
-use std::net::{TcpStream, SocketAddr, ToSocketAddrs};
+use std::net::{TcpStream, SocketAddr, ToSocketAddrs, Shutdown};
 use std::{io, thread, mem, fmt};
 use std::time::Duration;
 use std::str::FromStr;
@@ -10,8 +10,9 @@ use sha1::{Sha1, Digest};
 use std::collections::{HashMap, VecDeque};
 use linked_hash_map::LinkedHashMap;
 use num_derive::FromPrimitive;
-use num_traits::FromPrimitive;
+use num_traits::{FromPrimitive, ToPrimitive};
 use std::cmp::min;
+use strum_macros::Display;
 
 extern crate byteorder;
 #[macro_use]
@@ -74,81 +75,31 @@ struct Interval {
 impl fmt::Display for CapabilityFlags {
     fn fmt(&self, f: &mut fmt::Formatter) -> fmt::Result {
         let mut enabled_flags = Vec::new();
-        if self.intersects(CapabilityFlags::CLIENT_LONG_PASSWORD) {
-            enabled_flags.push("CLIENT_LONG_PASSWORD")
-        }
-        if self.intersects(CapabilityFlags::CLIENT_FOUND_ROWS) {
-            enabled_flags.push("CLIENT_FOUND_ROWS")
-        }
-        if self.intersects(CapabilityFlags::CLIENT_LONG_FLAG) {
-            enabled_flags.push("CLIENT_LONG_FLAG")
-        }
-        if self.intersects(CapabilityFlags::CLIENT_CONNECT_WITH_DB) {
-            enabled_flags.push("CLIENT_CONNECT_WITH_DB")
-        }
-        if self.intersects(CapabilityFlags::CLIENT_NO_SCHEMA) {
-            enabled_flags.push("CLIENT_NO_SCHEMA")
-        }
-        if self.intersects(CapabilityFlags::CLIENT_COMPRESS) {
-            enabled_flags.push("CLIENT_COMPRESS")
-        }
-        if self.intersects(CapabilityFlags::CLIENT_ODBC) {
-            enabled_flags.push("CLIENT_ODBC")
-        }
-        if self.intersects(CapabilityFlags::CLIENT_LOCAL_FILES) {
-            enabled_flags.push("CLIENT_LOCAL_FILES")
-        }
-        if self.intersects(CapabilityFlags::CLIENT_IGNORE_SPACE) {
-            enabled_flags.push("CLIENT_IGNORE_SPACE")
-        }
-        if self.intersects(CapabilityFlags::CLIENT_PROTOCOL_41) {
-            enabled_flags.push("CLIENT_PROTOCOL_41")
-        }
-        if self.intersects(CapabilityFlags::CLIENT_INTERACTIVE) {
-            enabled_flags.push("CLIENT_INTERACTIVE")
-        }
-        if self.intersects(CapabilityFlags::CLIENT_SSL) {
-            enabled_flags.push("CLIENT_SSL")
-        }
-        if self.intersects(CapabilityFlags::CLIENT_IGNORE_SIGPIPE) {
-            enabled_flags.push("CLIENT_IGNORE_SIGPIPE")
-        }
-        if self.intersects(CapabilityFlags::CLIENT_TRANSACTIONS) {
-            enabled_flags.push("CLIENT_TRANSACTIONS")
-        }
-        if self.intersects(CapabilityFlags::CLIENT_RESERVED) {
-            enabled_flags.push("CLIENT_RESERVED")
-        }
-        if self.intersects(CapabilityFlags::CLIENT_SECURE_CONNECTION) {
-            enabled_flags.push("CLIENT_SECURE_CONNECTION")
-        }
-        if self.intersects(CapabilityFlags::CLIENT_MULTI_STATEMENTS) {
-            enabled_flags.push("CLIENT_MULTI_STATEMENTS")
-        }
-        if self.intersects(CapabilityFlags::CLIENT_MULTI_RESULTS) {
-            enabled_flags.push("CLIENT_MULTI_RESULTS")
-        }
-        if self.intersects(CapabilityFlags::CLIENT_PS_MULTI_RESULTS) {
-            enabled_flags.push("CLIENT_PS_MULTI_RESULTS")
-        }
-        if self.intersects(CapabilityFlags::CLIENT_PLUGIN_AUTH) {
-            enabled_flags.push("CLIENT_PLUGIN_AUTH")
-        }
-        if self.intersects(CapabilityFlags::CLIENT_CONNECT_ATTRS) {
-            enabled_flags.push("CLIENT_CONNECT_ATTRS")
-        }
-        if self.intersects(CapabilityFlags::CLIENT_PLUGIN_AUTH_LENENC_CLIENT_DATA) {
-            enabled_flags.push("CLIENT_PLUGIN_AUTH_LENENC_CLIENT_DATA")
-        }
-        if self.intersects(CapabilityFlags::CLIENT_CAN_HANDLE_EXPIRED_PASSWORDS) {
-            enabled_flags.push("CLIENT_CAN_HANDLE_EXPIRED_PASSWORDS")
-        }
-        if self.intersects(CapabilityFlags::CLIENT_SESSION_TRACK) {
-            enabled_flags.push("CLIENT_SESSION_TRACK")
-        }
-        if self.intersects(CapabilityFlags::CLIENT_DEPRECATE_EOF) {
-            enabled_flags.push("CLIENT_DEPRECATE_EOF")
-        }
+        if self.contains(CapabilityFlags::CLIENT_LONG_PASSWORD) { enabled_flags.push("CLIENT_LONG_PASSWORD") }
+        if self.contains(CapabilityFlags::CLIENT_FOUND_ROWS) { enabled_flags.push("CLIENT_FOUND_ROWS") }
+        if self.contains(CapabilityFlags::CLIENT_LONG_FLAG) { enabled_flags.push("CLIENT_LONG_FLAG") }
+        if self.contains(CapabilityFlags::CLIENT_CONNECT_WITH_DB) { enabled_flags.push("CLIENT_CONNECT_WITH_DB") }
+        if self.contains(CapabilityFlags::CLIENT_NO_SCHEMA) { enabled_flags.push("CLIENT_NO_SCHEMA") }
+        if self.contains(CapabilityFlags::CLIENT_COMPRESS) { enabled_flags.push("CLIENT_COMPRESS") }
+        if self.contains(CapabilityFlags::CLIENT_ODBC) { enabled_flags.push("CLIENT_ODBC") }
+        if self.contains(CapabilityFlags::CLIENT_LOCAL_FILES) { enabled_flags.push("CLIENT_LOCAL_FILES") }
+        if self.contains(CapabilityFlags::CLIENT_IGNORE_SPACE) { enabled_flags.push("CLIENT_IGNORE_SPACE") }
+        if self.contains(CapabilityFlags::CLIENT_PROTOCOL_41) { enabled_flags.push("CLIENT_PROTOCOL_41") }
+        if self.contains(CapabilityFlags::CLIENT_INTERACTIVE) { enabled_flags.push("CLIENT_INTERACTIVE") }
+        if self.contains(CapabilityFlags::CLIENT_SSL) { enabled_flags.push("CLIENT_SSL") }
+        if self.contains(CapabilityFlags::CLIENT_IGNORE_SIGPIPE) { enabled_flags.push("CLIENT_IGNORE_SIGPIPE") }
+        if self.contains(CapabilityFlags::CLIENT_TRANSACTIONS) { enabled_flags.push("CLIENT_TRANSACTIONS") }
+        if self.contains(CapabilityFlags::CLIENT_RESERVED) { enabled_flags.push("CLIENT_RESERVED") }
+        if self.contains(CapabilityFlags::CLIENT_SECURE_CONNECTION) { enabled_flags.push("CLIENT_SECURE_CONNECTION") }
+        if self.contains(CapabilityFlags::CLIENT_MULTI_STATEMENTS) { enabled_flags.push("CLIENT_MULTI_STATEMENTS") }
+        if self.contains(CapabilityFlags::CLIENT_MULTI_RESULTS) { enabled_flags.push("CLIENT_MULTI_RESULTS") }
+        if self.contains(CapabilityFlags::CLIENT_PS_MULTI_RESULTS) { enabled_flags.push("CLIENT_PS_MULTI_RESULTS") }
+        if self.contains(CapabilityFlags::CLIENT_PLUGIN_AUTH) { enabled_flags.push("CLIENT_PLUGIN_AUTH") }
+        if self.contains(CapabilityFlags::CLIENT_CONNECT_ATTRS) { enabled_flags.push("CLIENT_CONNECT_ATTRS") }
+        if self.contains(CapabilityFlags::CLIENT_PLUGIN_AUTH_LENENC_CLIENT_DATA) { enabled_flags.push("CLIENT_PLUGIN_AUTH_LENENC_CLIENT_DATA") }
+        if self.contains(CapabilityFlags::CLIENT_CAN_HANDLE_EXPIRED_PASSWORDS) { enabled_flags.push("CLIENT_CAN_HANDLE_EXPIRED_PASSWORDS") }
+        if self.contains(CapabilityFlags::CLIENT_SESSION_TRACK) { enabled_flags.push("CLIENT_SESSION_TRACK") }
+        if self.contains(CapabilityFlags::CLIENT_DEPRECATE_EOF) { enabled_flags.push("CLIENT_DEPRECATE_EOF") }
         write!(f, "{}", enabled_flags.join("|"))
     }
 }
@@ -187,8 +138,10 @@ struct BinlogEventHeader {
 }
 
 /// https://dev.mysql.com/doc/internals/en/binlog-event-type.html
+/// https://github.com/mysql/mysql-server/blob/71f48ab393bce80a59e5a2e498cd1f46f6b43f9a/libbinlogevents/include/binlog_event.h#L245
 #[allow(non_camel_case_types)]
 #[derive(FromPrimitive)]
+#[derive(Display)]
 enum BinlogEventType {
     UNKNOWN_EVENT = 0x00,
     START_EVENT_V3 = 0x01,
@@ -226,6 +179,9 @@ enum BinlogEventType {
     GTID_EVENT = 0x21,
     ANONYMOUS_GTID_EVENT = 0x22,
     PREVIOUS_GTIDS_EVENT = 0x23,
+    TRANSACTION_CONTEXT_EVENT = 0x24,
+    VIEW_CHANGE_EVENT = 0x25,
+    XA_PREPARE_LOG_EVENT = 0x26,
 }
 
 bitflags! {
@@ -324,17 +280,18 @@ fn write_null_terminated_str(buf: &mut Vec<u8>, str: &str) -> usize {
     return written + 1;
 }
 
-fn build_com_register_slave_cmd(server_id: u32) -> Vec<u8> {
+fn build_com_register_slave_cmd(server_id: u32, slave_hostname: &str) -> Vec<u8> {
     let mut buf = vec![0_u8; 4];  // 4 bytes reserved for packet header
 
     buf.write_u8(0x15);  // COM_REGISTER_SLAVE command
     buf.write_u32::<LittleEndian>(server_id);
-    buf.write_u8(0);  // slaves hostname length
+    buf.write_u8(slave_hostname.len().to_u8().unwrap());  // slaves hostname length
+    write_str(&mut buf, slave_hostname);
     buf.write_u8(0);  // slaves user len
     buf.write_u8(0);  // slaves password len
-    buf.write_u16::<LittleEndian>(0);  // slaves mysql-port
-    buf.write_u32::<LittleEndian>(0);  // replication rank
-    buf.write_u32::<LittleEndian>(0);  // master-id
+    buf.write_u16::<LittleEndian>(0);  // slaves mysql-port, usually empty
+    buf.write_u32::<LittleEndian>(0);  // replication rank, ignored
+    buf.write_u32::<LittleEndian>(0);  // master-id, usually 0
 
     // fill packet header
     let packet_len = (buf.len() - 4) as u32;
@@ -488,12 +445,12 @@ fn parse_header_from_slice_or_vec(slice_or_vec: SliceOrVec) -> PacketHeader {
 /// Option::None is NULL value in ProtocolText::ResultsetRow context
 fn parse_length_encoded_int(buf: &[u8]) -> (Option<u64>, usize) {
     match buf[0] {
-        0xfb => (Option::None, 1),
-        0xfc => (Option::Some(LittleEndian::read_u16(&buf[1..]) as u64), 3),
-        0xfd => (Option::Some(LittleEndian::read_u24(&buf[1..]) as u64), 4),
-        0xfe => (Option::Some(LittleEndian::read_u64(&buf[1..])), 9),
+        0xfb => (None, 1),
+        0xfc => (Some(LittleEndian::read_u16(&buf[1..]) as u64), 3),
+        0xfd => (Some(LittleEndian::read_u24(&buf[1..]) as u64), 4),
+        0xfe => (Some(LittleEndian::read_u64(&buf[1..])), 9),
         0xff => panic!("unexpected 0xff prefix"),
-        _ => (Option::Some(buf[0] as u64), 1)
+        _ => (Some(buf[0] as u64), 1)
     }
 }
 
@@ -514,7 +471,7 @@ fn parse_binlog_event_header(payload: &[u8]) -> Result<BinlogEventHeader, Generi
             offset += 4;
             let flags = BinlogEventFlags::from_bits(LE::read_u16(&payload[offset..])).unwrap();
 
-            Result::Ok(BinlogEventHeader {
+            Ok(BinlogEventHeader {
                 timestamp,
                 event_type,
                 server_id,
@@ -589,7 +546,7 @@ enum GenericResponsePacket {
         last_insert_id: u64,
         status_flags: u16,
         warnings: u16,
-        /// human readable status information
+        /// human-readable status information
         info: String,
     },
     Err {
@@ -622,6 +579,17 @@ enum SliceOrVec<'a> {
     Vec(Vec::<u8>),
 }
 
+impl SliceOrVec<'_> {
+    fn get_payload(&self) -> &[u8] {
+        let payload: &[u8];
+        match self {
+            SliceOrVec::Slice(sl) => payload = sl,
+            SliceOrVec::Vec(v) => payload = v.as_slice(),
+        }
+        return payload;
+    }
+}
+
 impl BinLogClient {
     fn new(server_addr: SocketAddr,
            username: &str,
@@ -643,6 +611,35 @@ impl BinLogClient {
         }
     }
 
+    fn make_handshake(&mut self) -> io::Result<()> {
+        let handshake_packet = self.read_packet();
+
+        let payload: &[u8];
+        match &handshake_packet {
+            SliceOrVec::Slice(sl) => payload = sl,
+            SliceOrVec::Vec(v) => payload = v.as_slice(),
+        }
+
+        let handshake = parse_handshake(payload);
+        println!("{}", handshake.capability_flags);
+
+        if !handshake.capability_flags.intersects(CapabilityFlags::CLIENT_PROTOCOL_41) {
+            panic!("server does not support CLIENT_PROTOCOL_41")
+        }
+        if handshake.auth_plugin_name != "mysql_native_password" {
+            panic!("unsupported auth method")
+        }
+
+        let handshake_response = build_handshake_response(
+            &handshake,
+            &self.username,
+            &self.password,
+        );
+
+        self.tcp_stream.as_ref().unwrap().write(&handshake_response)?;
+        Ok(())
+    }
+
     fn connect(&mut self, timeout: Duration) -> io::Result<()> {
         if self.is_connected {
             print!("already connected");
@@ -655,44 +652,13 @@ impl BinLogClient {
             Ok(mut stream) => {
                 self.tcp_stream = Some(stream);
 
-                {
-                    let handshake_packet = self.read_packet();
-
-                    let payload: &[u8];
-                    match &handshake_packet {
-                        SliceOrVec::Slice(sl) => payload = sl,
-                        SliceOrVec::Vec(v) => payload = v.as_slice(),
-                    }
-
-                    let handshake = parse_handshake(payload);
-                    println!("{}", handshake.capability_flags);
-
-                    if !handshake.capability_flags.intersects(CapabilityFlags::CLIENT_PROTOCOL_41) {
-                        panic!("server does not support CLIENT_PROTOCOL_41")
-                    }
-                    if handshake.auth_plugin_name != "mysql_native_password" {
-                        panic!("unsupported auth method")
-                    }
-
-                    let handshake_response = build_handshake_response(
-                        &handshake,
-                        &self.username,
-                        &self.password,
-                    );
-
-                    self.tcp_stream.as_ref().unwrap().write(&handshake_response);
-                }
+                self.make_handshake();
 
                 {
                     let packet = self.read_packet();
-                    let payload: &[u8];
-                    match &packet {
-                        SliceOrVec::Slice(sl) => payload = sl,
-                        SliceOrVec::Vec(v) => payload = v.as_slice(),
-                    }
+                    let payload = packet.get_payload();
 
                     let packet = parse_generic_response(payload);
-
                     match packet {
                         GenericResponsePacket::Err { error_code, sql_state_marker, sql_state, error_message } => {
                             println!("{}", error_message);
@@ -727,6 +693,83 @@ impl BinLogClient {
                 }
 
                 {
+                    let com_query_cmd = build_com_query_cmd("set wait_timeout=10");
+                    self.tcp_stream.as_ref().unwrap().write(&com_query_cmd);
+
+                    let packet = self.read_packet();
+                    let payload: Vec<u8>;
+                    match &packet {
+                        SliceOrVec::Slice(sl) => payload = sl.to_vec(),
+                        SliceOrVec::Vec(v) => payload = v.clone(),
+                    }
+                    // TODO : parse COM_QUERY result ?
+                    if payload[0] == 0xff {
+                        println!("error");
+                    }
+                }
+
+                {
+                    let com_query_cmd = build_com_query_cmd("set interactive_timeout=10");
+                    self.tcp_stream.as_ref().unwrap().write(&com_query_cmd);
+
+                    let packet = self.read_packet();
+                    let payload: Vec<u8>;
+                    match &packet {
+                        SliceOrVec::Slice(sl) => payload = sl.to_vec(),
+                        SliceOrVec::Vec(v) => payload = v.clone(),
+                    }
+                    // TODO : parse COM_QUERY result ?
+                    if payload[0] == 0xff {
+                        println!("error");
+                    }
+                }
+
+                {
+                    let com_query_cmd = build_com_query_cmd("set net_retry_count=1");
+                    self.tcp_stream.as_ref().unwrap().write(&com_query_cmd);
+
+                    let packet = self.read_packet();
+                    let payload: Vec<u8>;
+                    match &packet {
+                        SliceOrVec::Slice(sl) => payload = sl.to_vec(),
+                        SliceOrVec::Vec(v) => payload = v.clone(),
+                    }
+                    // TODO : parse COM_QUERY result ?
+                    if payload[0] == 0xff {
+                        println!("error");
+                    }
+                }
+
+                {
+                    let com_query_cmd = build_com_query_cmd("set net_read_timeout=5");
+                    self.tcp_stream.as_ref().unwrap().write(&com_query_cmd);
+
+                    let packet = self.read_packet();
+                    let payload: Vec<u8>;
+                    match &packet {
+                        SliceOrVec::Slice(sl) => payload = sl.to_vec(),
+                        SliceOrVec::Vec(v) => payload = v.clone(),
+                    }
+                    // TODO : parse COM_QUERY result ?
+                    if payload[0] == 0xff {
+                        println!("error");
+                    }
+                }
+
+                {
+                    let com_register_slave_cmd = build_com_register_slave_cmd(111111, "slave_name");
+                    self.tcp_stream.as_ref().unwrap().write(&com_register_slave_cmd);
+
+                    let packet = self.read_packet();
+
+                    //let com_quit_cmd = build_com_quit_cmd();
+                    //self.tcp_stream.as_ref().unwrap().write(&com_quit_cmd);
+                    //self.read_packet();
+
+                    //self.tcp_stream.as_ref().unwrap().shutdown(std::net::Shutdown::Both);
+                }
+
+                {
                     // TODO : server_id
                     let binlog_dump_gtid_cmd = build_com_binlog_dump_gtid_cmd(2345335, &self.gtid_set);
                     self.tcp_stream.as_ref().unwrap().write(&binlog_dump_gtid_cmd);
@@ -746,9 +789,18 @@ impl BinLogClient {
 
                                 let events_hander = self.events_handler;
                                 events_hander(event_header);
+
+                                //let com_quit_cmd = build_com_quit_cmd();
+                                //self.tcp_stream.as_ref().unwrap().write(&com_quit_cmd);
                             }
                             Err(error_packet) => {
                                 println!("error");
+
+                                let com_quit_cmd = build_com_quit_cmd();
+                                self.tcp_stream.as_ref().unwrap().write(&com_quit_cmd);
+                                self.tcp_stream.as_ref().unwrap().shutdown(std::net::Shutdown::Both);
+                                self.read_packet();
+
                                 break;
                             }
                         }
@@ -874,14 +926,16 @@ impl BinLogClient {
         return offset - 1 > self.size;
     }
 
-    fn disconnect(&mut self) {
+    fn disconnect(&mut self) -> io::Result<()> {
         // TODO :
         self.is_connected = false;
+        self.tcp_stream.as_ref().unwrap().shutdown(Shutdown::Both)?;
+        Ok(())
     }
 }
 
 fn handler(event: BinlogEventHeader) {
-    println!("binlog event {}", event.event_type as u8);
+    println!("binlog event {}", event.event_type);
 }
 
 fn real_main() -> i32 {
@@ -900,11 +954,19 @@ fn real_main() -> i32 {
         let mut map = LinkedHashMap::new();
         map.insert(String::from("1b8ef66e-f31a-11ea-968f-0bed86d59b89"), UuidSet {
             server_uuid: String::from("1b8ef66e-f31a-11ea-968f-0bed86d59b89"),
-            intervals: vec![Interval { start: 1, end: 345822653 }],
+            intervals: vec![Interval { start: 1, end: 354192351 }],
+        });
+        map.insert(String::from("9ce4c5f9-d8f5-11ef-baf7-0a68eb6536de"), UuidSet {
+            server_uuid: String::from("9ce4c5f9-d8f5-11ef-baf7-0a68eb6536de"),
+            intervals: vec![Interval { start: 1, end: 5868119 }],
+        });
+        map.insert(String::from("e9bc7f92-d729-11ef-8c87-f1d96f9dc506"), UuidSet {
+            server_uuid: String::from("e9bc7f92-d729-11ef-8c87-f1d96f9dc506"),
+            intervals: vec![Interval { start: 1, end: 4191677 }],
         });
         map.insert(String::from("fad9b072-f319-11ea-a6e2-6fae1c7e284a"), UuidSet {
             server_uuid: String::from("fad9b072-f319-11ea-a6e2-6fae1c7e284a"),
-            intervals: vec![Interval { start: 1, end: 227699223 }],
+            intervals: vec![Interval { start: 1, end: 237311341 }],
         });
         let mut client = BinLogClient::new(socket_addr.clone(),
                                            &settings_map["username"],
